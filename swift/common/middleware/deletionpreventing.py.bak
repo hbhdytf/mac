@@ -1,0 +1,31 @@
+import os
+from swift.common.swob import Request, Response
+import base64
+import MySQLdb
+
+class DeletionPreventingMiddleware(object):
+    def __init__(self, app,conf):
+        self.app = app
+	print "vincent middleware"
+        print app
+    def __call__(self, env, start_response):
+        print "it in deletionprevention middleware"
+        if env['REQUEST_METHOD'] != 'DELETE':
+            print "not put method"
+            return self.app(env, start_response)
+        conn = MySQLdb.connect(host="127.0.0.1", user="root", passwd="123456", db="auth", charset="utf8")
+        cur = conn.cursor()
+        cur.execute('select * from TUser')
+        for row in cur.fetchall():
+            user = row[3].encode('utf-8')
+            print "mysqlmysqlmysqlmysql:%s" % row[0]
+        return Response( status=403, body="Delete prohibited User:%s" % env, content_type="text/plain")(env, start_response)
+        '''return Response( status=403, body="Delete prohibited %s" % env, content_type="text/plain")(env, start_response)'''
+def filter_factory(global_conf, **local_conf):
+    conf = global_conf.copy()
+    conf.update(local_conf)
+    print conf
+    def deletionpreventing_filter(app):
+        print "deletion"
+        return DeletionPreventingMiddleware(app, conf)
+    return deletionpreventing_filter

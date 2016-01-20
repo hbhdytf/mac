@@ -81,7 +81,7 @@ def setup_env():
                 "Running as non-root?"))
 
     # Set PYTHON_EGG_CACHE if it isn't already set
-    os.environ.setdefault('PYTHON_EGG_CACHE', '/tmp')
+    os.environ.setdefault('PYTHON_EGG_CACHE', '/tmp/.python-eggs')
 
 
 def command(func):

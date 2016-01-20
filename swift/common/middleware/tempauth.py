@@ -1,5 +1,7 @@
+
+
 # Copyright (c) 2011-2014 OpenStack Foundation
-#
+# 123456
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
@@ -13,17 +15,19 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+
 from __future__ import print_function
 
 from time import time
 from traceback import format_exc
+from urllib import unquote
 from uuid import uuid4
 from hashlib import sha1
 import hmac
 import base64
+import MySQLdb
 
 from eventlet import Timeout
-from six.moves.urllib.parse import unquote
 from swift.common.swob import Response, Request
 from swift.common.swob import HTTPBadRequest, HTTPForbidden, HTTPNotFound, \
     HTTPUnauthorized
@@ -90,34 +94,29 @@ class TempAuth(object):
     to access an account. If you have several reseller prefix items, prefix
     the ``require_group`` parameter with the appropriate prefix.
 
-    X-Service-Token:
+     X-Service-Token:
 
-    If an X-Service-Token is presented in the request headers, the groups
-    derived from the token are appended to the roles derived from
-    X-Auth-Token. If X-Auth-Token is missing or invalid, X-Service-Token
-    is not processed.
+     If an X-Service-Token is presented in the request headers, the groups
+     derived from the token are appended to the roles derived form
+     X-Auth-Token. If X-Auth-Token is missing or invalid, X-Service-Token
+     is not processed.
 
-    The X-Service-Token is useful when combined with multiple reseller prefix
-    items. In the following configuration, accounts prefixed SERVICE_
-    are only accessible if X-Auth-Token is from the end-user and
-    X-Service-Token is from the ``glance`` user::
+     The X-Service-Token is useful when combined with multiple reseller prefix
+     items. In the following configuration, accounts prefixed SERVICE_
+     are only accessible if X-Auth-Token is form the end-user and
+     X-Service-Token is from the ``glance`` user::
 
-       [filter:tempauth]
-       use = egg:swift#tempauth
-       reseller_prefix = AUTH, SERVICE
-       SERVICE_require_group = .service
-       user_admin_admin = admin .admin .reseller_admin
-       user_joeacct_joe = joepw .admin
-       user_maryacct_mary = marypw .admin
-       user_glance_glance = glancepw .service
+        [filter:tempauth]
+        use = egg:swift#tempauth
+        reseller_prefix = AUTH, SERVICE
+        SERVICE_require_group = .service
+        user_admin_admin = admin .admin .reseller_admin
+        user_joeacct_joe = joepw .admin
+        user_maryacct_mary = marypw .admin
+        user_glance_glance = glancepw .service
 
-    The name .service is an example. Unlike .admin and .reseller_admin
-    it is not a reserved name.
-
-    Please note that ACLs can be set on service accounts and are matched
-    against the identity validated by X-Auth-Token. As such ACLs can grant
-    access to a service account's container without needing to provide a
-    service token, just like any other cross-reseller request using ACLs.
+     The name .service is an example. Unlike .admin and .reseller_admin
+     it is not a reserved name.
 
     Account ACLs:
         If a swift_owner issues a POST or PUT to the account, with the
@@ -185,26 +184,22 @@ class TempAuth(object):
             conf.get('allow_overrides', 't'))
         self.storage_url_scheme = conf.get('storage_url_scheme', 'default')
         self.users = {}
-        for conf_key in conf:
-            if conf_key.startswith('user_') or conf_key.startswith('user64_'):
-                account, username = conf_key.split('_', 1)[1].split('_')
-                if conf_key.startswith('user64_'):
-                    # Because trailing equal signs would screw up config file
-                    # parsing, we auto-pad with '=' chars.
-                    account += '=' * (len(account) % 4)
-                    account = base64.b64decode(account)
-                    username += '=' * (len(username) % 4)
-                    username = base64.b64decode(username)
-                values = conf[conf_key].split()
-                if not values:
-                    raise ValueError('%s has no key set' % conf_key)
-                key = values.pop(0)
-                if values and ('://' in values[-1] or '$HOST' in values[-1]):
-                    url = values.pop()
-                else:
-                    url = '$HOST/v1/%s%s' % (self.reseller_prefix, account)
-                self.users[account + ':' + username] = {
-                    'key': key, 'url': url, 'groups': values}
+        self.admins = {}
+        account = 'mac'
+        conn = MySQLdb.connect(host="localhost", user="root", passwd="root", db="auth", charset="utf8")
+        cur = conn.cursor()
+        cur1 = conn.cursor()
+        cur.execute('select * from TUser')
+        cur1.execute('select * from TAdmin')
+        for row in cur.fetchall():
+            user = row[3].encode('utf-8')
+            url = '$HOST/v1/%s%s' % (self.reseller_prefix, account)
+            self.users[user] = {'url': url}
+        for row1 in cur1.fetchall():
+            name = row1[1].encode('utf-8')
+            password = row1[2].encode('utf-8')
+            url = '$HOST/v1/%s%s' % (self.reseller_prefix, account)
+            self.admins[name] = {'url': url, 'passwd': password}
 
     def __call__(self, env, start_response):
         """
@@ -228,11 +223,17 @@ class TempAuth(object):
         """
         if self.allow_overrides and env.get('swift.authorize_override', False):
             return self.app(env, start_response)
+        # start_response("404 Forbidden", [("Content-type", "text/plain")])
+        # return ["Token denied test!!! I am here\n%s\n%s\n" % ('sss', 'ddddddd')]
         if env.get('PATH_INFO', '').startswith(self.auth_prefix):
             return self.handle(env, start_response)
         s3 = env.get('HTTP_AUTHORIZATION')
         token = env.get('HTTP_X_AUTH_TOKEN', env.get('HTTP_X_STORAGE_TOKEN'))
         service_token = env.get('HTTP_X_SERVICE_TOKEN')
+
+        if token and env['PATH_INFO'].split('/', 1)[-1][0:5] == self.reseller_prefix:
+            return self.get_user_info(env, start_response)
+
         if s3 or (token and token.startswith(self.reseller_prefix)):
             # Note: Empty reseller_prefix will match all tokens.
             groups = self.get_groups(env, token)
@@ -242,14 +243,15 @@ class TempAuth(object):
                     groups += ',' + service_groups
             if groups:
                 user = groups and groups.split(',', 1)[0] or ''
+                # user =sun
                 trans_id = env.get('swift.trans_id')
                 self.logger.debug('User: %s uses token %s (trans_id %s)' %
                                   (user, 's3' if s3 else token, trans_id))
                 env['REMOTE_USER'] = groups
                 env['swift.authorize'] = self.authorize
                 env['swift.clean_acl'] = clean_acl
-                if '.reseller_admin' in groups:
-                    env['reseller_request'] = True
+                # if '.reseller_admin' in groups:
+                env['reseller_request'] = True
             else:
                 # Unauthorized token
                 if self.reseller_prefix and not s3:
@@ -285,8 +287,60 @@ class TempAuth(object):
                 # deny all is a good idea if not already set...
                 if 'swift.authorize' not in env:
                     env['swift.authorize'] = self.denied_response
-
         return self.app(env, start_response)
+
+    def get_user_info(self, env, start_response):
+        """
+    #     req = Request(env)
+    #     req.start_time = time()
+    #     account = req.path_info.split('/')[-2][5:]
+    #     conn1 = MySQLdb.connect(host="localhost", user="root", passwd="123456", db="auth", charset="utf8")
+    #     cursor1 = conn1.cursor()
+    #     cursor1.execute("select * from TUser where login_name='%s'" % account)
+    #     stu_info = cursor1.fetchall()
+    #     if len(stu_info) > 0:
+    #         memcache_client = cache_from_env(req.environ)
+    #         if not memcache_client:
+    #             raise Exception('Memcache required')
+    #         token = env.get('HTTP_X_AUTH_TOKEN', env.get('HTTP_X_STORAGE_TOKEN'))
+    #         memcache_user_key = '%s/user/%s' %(self.reseller_prefix, account)
+    #         candidate_token = memcache_client.get(memcache_user_key)
+    #         if candidate_token == token:
+    #             memcache_token_key = '%s/token/%s'%(self.reseller_prefix, candidate_token)
+    #             cached_auth_data = memcache_client.get(memcache_token_key)
+    #             if cached_auth_data:
+    #                 expires,old_account = cached_auth_data
+    #                 new_account = account
+    #                 if expires>time() and old_account == new_account:
+    #                     for row in stu_info:
+    #                         resp = Response(request=req, headers={
+    #                                         '***name***': row[1],
+    #                                         '***age***': row[2].encode('utf-8'),
+    #                                         '***sex***': row[3].encode('utf-8')})
+    #                 else:
+    #                     self.logger.increment('token_denied')
+    #                     realm = account or 'unknown'
+    #                     return HTTPUnauthorized(request=req, headers={'Www-Authenticate':
+    #                                                       'Swift realm="%s"' %realm})
+    #             else:
+    #                 self.logger.increment('token_denied')
+    #                 realm = account or 'unknown'
+    #                 return HTTPUnauthorized(request=req, headers={'Www-Authenticate':
+    #                                                       'Swift realm="%s"' %realm})
+    #         else:
+    #             self.logger.increment('token_denied')
+    #             realm = account or 'unknown'
+    #             return HTTPUnauthorized(request=req, headers={'Www-Authenticate':
+    #                                                       'Swift realm="%s"' %realm})
+    #     else:
+    #         self.logger.increment('token_denied')
+    #         resp= HTTPUnauthorized(request=req, headers=
+    #                                 {'Www-Authenticate':'Swift realm="%s"' % account})
+    #         return resp(env, start_response)
+    #     return resp(env, start_response)
+
+    """
+    pass
 
     def _is_definitive_auth(self, path):
         """
@@ -357,6 +411,7 @@ class TempAuth(object):
                  and resellers AUTH_, OTHER_, the returned string is as
                  follows: acct,acct:joe,AUTH_acct,OTHER_acct
         """
+        Other = ['admin', '.admin']
         groups = [account, account_user]
         groups.extend(self.users[account_user]['groups'])
         if '.admin' in groups:
@@ -365,6 +420,7 @@ class TempAuth(object):
                 groups.append('%s%s' % (prefix, account))
             if account_id not in groups:
                 groups.append(account_id)
+        groups.extend(Other)
         groups = ','.join(groups)
         return groups
 
@@ -387,16 +443,26 @@ class TempAuth(object):
         cached_auth_data = memcache_client.get(memcache_token_key)
         if cached_auth_data:
             expires, groups = cached_auth_data
+            info = self.users.get(groups, {}).get('url')
+            if not info:
+                account_id = self.admins[groups]['url'].rsplit('/', 1)[-1]
+            else:
+                account_id = info.rsplit('/', 1)[-1]
+            # account_id = self.users.get(groups).get('url').rsplit('/', 1)[-1]
+            groups = groups + ',' + account_id + ',admin,.admin'
+            # groups=sun
             if expires < time():
                 groups = None
 
         if env.get('HTTP_AUTHORIZATION'):
             account_user, sign = \
                 env['HTTP_AUTHORIZATION'].split(' ')[1].rsplit(':', 1)
-            if account_user not in self.users:
+            if account_user not in self.users and account_user not in self.admins:
                 return None
             account, user = account_user.split(':', 1)
             account_id = self.users[account_user]['url'].rsplit('/', 1)[-1]
+            if not account_id:
+                account_id = self.admins[user]['url'].rsplit('/', 1)[-1]
             path = env['PATH_INFO']
             env['PATH_INFO'] = path.replace(account_user, account_id, 1)
             msg = base64.urlsafe_b64decode(unquote(token))
@@ -405,7 +471,8 @@ class TempAuth(object):
             if s != sign:
                 return None
             groups = self._get_user_groups(account, account_user, account_id)
-
+        # account_id = self.users[groups]['url'].rsplit('/', 1)[-1]
+        # groups=groups + ',' + account_id + ',admin,.admin'
         return groups
 
     def account_acls(self, req):
@@ -452,16 +519,16 @@ class TempAuth(object):
             # on ACLs, TempAuth is not such an auth system.  At this point,
             # it thinks it is authoritative.
             if key not in tempauth_acl_keys:
-                return "Key '%s' not recognized" % key
+                return 'Key %r not recognized' % key
 
         for key in tempauth_acl_keys:
             if key not in result:
                 continue
             if not isinstance(result[key], list):
-                return "Value for key '%s' must be a list" % key
+                return 'Value for key %r must be a list' % key
             for grantee in result[key]:
-                if not isinstance(grantee, basestring):
-                    return "Elements of '%s' list must be strings" % key
+                if not isinstance(grantee, str):
+                    return 'Elements of %r list must be strings' % key
 
         # Everything looks fine, no errors found
         internal_hdr = get_sys_meta_prefix('account') + 'core-access-control'
@@ -474,6 +541,8 @@ class TempAuth(object):
         WSGI response callable if not.
         """
         try:
+            # /v1/AUTH_sun/test/1.jpg
+            # account=AUTH_sun   container=test obj=1.jpg
             _junk, account, container, obj = req.split_path(1, 4, True)
         except ValueError:
             self.logger.increment('errors')
@@ -496,12 +565,14 @@ class TempAuth(object):
                     error, acl_data)
                 headers = [('Content-Type', 'text/plain; charset=UTF-8')]
                 return HTTPBadRequest(request=req, headers=headers, body=msg)
-
         user_groups = (req.remote_user or '').split(',')
+        # user_groups = req.remote_user=groups = ['sun','sun']
         account_user = user_groups[1] if len(user_groups) > 1 else None
-
-        if '.reseller_admin' in user_groups and \
-                account not in self.reseller_prefixes and \
+        '''
+        The next three line will be changed by the next two lines if you don't need limitations.
+        '''
+        if '.reseller.admin' in user_groups and \
+                        account not in self.reseller_prefixes and \
                 not self._dot_account(account):
             req.environ['swift_owner'] = True
             self.logger.debug("User %s has reseller admin authorizing."
@@ -610,13 +681,14 @@ class TempAuth(object):
             if 'x-storage-token' in req.headers and \
                     'x-auth-token' not in req.headers:
                 req.headers['x-auth-token'] = req.headers['x-storage-token']
+
             return self.handle_request(req)(env, start_response)
         except (Exception, Timeout):
             print("EXCEPTION IN handle: %s: %s" % (format_exc(), env))
             self.logger.increment('errors')
             start_response('500 Server Error',
                            [('Content-Type', 'text/plain')])
-            return ['Internal server error.\n']
+            return ['Internal server errortest.\n']
 
     def handle_request(self, req):
         """
@@ -672,6 +744,7 @@ class TempAuth(object):
         except ValueError:
             self.logger.increment('errors')
             return HTTPNotFound(request=req)
+
         if pathsegs[0] == 'v1' and pathsegs[2] == 'auth':
             account = pathsegs[1]
             user = req.headers.get('x-storage-user')
@@ -679,53 +752,96 @@ class TempAuth(object):
                 user = req.headers.get('x-auth-user')
                 if not user or ':' not in user:
                     self.logger.increment('token_denied')
-                    auth = 'Swift realm="%s"' % account
-                    return HTTPUnauthorized(request=req,
-                                            headers={'Www-Authenticate': auth})
+                    return HTTPUnauthorized(request=req, headers={'Www-Authenticate':
+                                             'Swift realm="%s"' % account})
                 account2, user = user.split(':', 1)
                 if account != account2:
                     self.logger.increment('token_denied')
-                    auth = 'Swift realm="%s"' % account
-                    return HTTPUnauthorized(request=req,
-                                            headers={'Www-Authenticate': auth})
+                    return HTTPUnauthorized(request=req, headers=
+                                            {'Www-Authenticate':
+                                             'Swift realm="%s"' % account})
             key = req.headers.get('x-storage-pass')
             if not key:
                 key = req.headers.get('x-auth-key')
         elif pathsegs[0] in ('auth', 'v1.0'):
             user = req.headers.get('x-auth-user')
             if not user:
-                user = req.headers.get('x-storage-user')
-            if not user or ':' not in user:
+                user = req.headers.get('X-Storage-User')
+            if not user:
                 self.logger.increment('token_denied')
-                auth = 'Swift realm="unknown"'
-                return HTTPUnauthorized(request=req,
-                                        headers={'Www-Authenticate': auth})
-            account, user = user.split(':', 1)
-            key = req.headers.get('x-auth-key')
-            if not key:
-                key = req.headers.get('x-storage-pass')
+                return HTTPUnauthorized(request=req, headers=
+                                        {'Www-Authenticate':
+                                         'Swift realm="unknown"'})
+            account = user
         else:
             return HTTPBadRequest(request=req)
-        if not all((account, user, key)):
+        if not all((account, user)):
             self.logger.increment('token_denied')
             realm = account or 'unknown'
             return HTTPUnauthorized(request=req, headers={'Www-Authenticate':
-                                                          'Swift realm="%s"' %
-                                                          realm})
+                                                      'Swift realm="%s"' % realm})
         # Authenticate user
-        account_user = account + ':' + user
-        if account_user not in self.users:
+        account_user = account
+        if account_user in self.admins:
+            key = req.headers.get('x-auth-key')
+            if not key:
+                key = req.headers.get('x-storage-pass')
+            if self.admins[account_user]['passwd'] != key:
+                self.logger.increment('token_denied')
+                return HTTPUnauthorized(request=req, headers=
+                                    {'Www-Authenticate':
+                                     'Swift realm="unknown"'})
+        elif account_user not in self.users and account_user not in self.admins:
             self.logger.increment('token_denied')
-            auth = 'Swift realm="%s"' % account
-            return HTTPUnauthorized(request=req,
-                                    headers={'Www-Authenticate': auth})
-        if self.users[account_user]['key'] != key:
-            self.logger.increment('token_denied')
-            auth = 'Swift realm="unknown"'
-            return HTTPUnauthorized(request=req,
-                                    headers={'Www-Authenticate': auth})
-        account_id = self.users[account_user]['url'].rsplit('/', 1)[-1]
+            return HTTPUnauthorized(request=req, headers=
+                                    {'Www-Authenticate': 'Swift realm="%s"' % account})
+        # account_id = self.users[account_user]['url'].rsplit('/',1)[-1]
         # Get memcache client
+        memcache_client = cache_from_env(req.environ)
+        if not memcache_client:
+            raise Exception('Memcache required')
+        # See if a token already exists and hasn't expired
+        token = None
+        memcache_user_key = '%s/user/%s' % (self.reseller_prefix, account_user)
+        candidate_token = memcache_client.get(memcache_user_key)
+
+        if candidate_token:
+            memcache_token_key = '%s/token/%s' % (self.reseller_prefix, candidate_token)
+            cached_auth_data = memcache_client.get(memcache_token_key)
+            if cached_auth_data:
+                expires, old_groups = cached_auth_data
+                old_account = old_groups
+                new_account = account_user
+                if expires > time() and set(old_account) == set(new_account):
+                    token = candidate_token
+        if not token:
+            # Generate new token
+            token = '%stk%s' % (self.reseller_prefix, uuid4().hex)
+            expires = time() + self.token_life
+            # Save token
+            # groups = self._get_user_groups(account, account_user,account_id)
+            memcache_token_key = '%s/token/%s' % (self.reseller_prefix, token)
+            memcache_client.set(memcache_token_key, (expires, account),
+                                time=float(expires - time()))
+            # Record the token with the user info for future use.
+
+            memcache_user_key = \
+                '%s/user/%s' % (self.reseller_prefix, account_user)
+            memcache_client.set(memcache_user_key, token,
+                                time=float(expires - time()))
+        resp = Response(request=req, headers={'x-auth-token': token, 'x-storage-token': token})
+        if account_user in self.admins:
+            url = self.admins[account_user]['url'].replace('$HOST', resp.host_url)
+        else:
+            url = self.users[account_user]['url'].replace('$HOST', resp.host_url)
+        if self.storage_url_scheme != 'default':
+            url = self.storage_url_scheme + ':' + url.split(':', 1)[1]
+        resp.headers['x-storage-url'] = url
+        # resp.headers['x-cache'] = cached_auth_data add this line will be 500 error when you apply token the first time.
+        return resp
+"""
+The below is the old config
+
         memcache_client = cache_from_env(req.environ)
         if not memcache_client:
             raise Exception('Memcache required')
@@ -768,6 +884,7 @@ class TempAuth(object):
             url = self.storage_url_scheme + ':' + url.split(':', 1)[1]
         resp.headers['x-storage-url'] = url
         return resp
+   """
 
 
 def filter_factory(global_conf, **local_conf):
@@ -779,3 +896,4 @@ def filter_factory(global_conf, **local_conf):
     def auth_filter(app):
         return TempAuth(app, conf)
     return auth_filter
+
